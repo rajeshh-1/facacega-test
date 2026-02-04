@@ -31,5 +31,13 @@ export const CONFIG = {
     polygonWssUrls: (process.env.POLYGON_WSS_URLS || "").split(",").map((s) => s.trim()).filter(Boolean),
     polygonWssUrl: process.env.POLYGON_WSS_URL || "",
     btcUsdAggregator: process.env.CHAINLINK_BTC_USD_AGGREGATOR || "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+  },
+
+  trading: {
+    dryRun: (process.env.DRY_RUN || "true").toLowerCase() === "true",
+    targetSpendUsd: Number(process.env.TARGET_SPEND_USD || "1.10"),
+    polyPrivateKey: process.env.POLY_PRIVATE_KEY || "",
+    polyProxyAddress: process.env.POLY_PROXY_ADDRESS || "", // Optional
+    metricsFile: "./logs/trades.csv"
   }
 };

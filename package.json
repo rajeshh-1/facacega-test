@@ -7,10 +7,10 @@
     "start": "node src/index.js"
   },
   "dependencies": {
-    "ethers": "^6.11.1",
+    "ethers": "^6.16.0",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",
-    "undici": "^6.21.3",
-    "ws": "^8.18.0"
+    "undici": "^6.23.0",
+    "ws": "^8.19.0"
   }
 }

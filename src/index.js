@@ -19,12 +19,13 @@ import { computeHeikenAshi, countConsecutive } from "./indicators/heikenAshi.js"
 import { detectRegime } from "./engines/regime.js";
 import { scoreDirection, applyTimeAwareness } from "./engines/probability.js";
 import { computeEdge, decide } from "./engines/edge.js";
-import { appendCsvRow, formatNumber, formatPct, getCandleWindowTiming, sleep } from "./utils.js";
+import { appendCsvRow, formatNumber, formatPct, getCandleWindowTiming, sleep, promiseWithTimeout } from "./utils.js";
 import { startBinanceTradeStream } from "./data/binanceWs.js";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
+import { trader } from "./trading/polymarketExecution.js";
 
 function countVwapCrosses(closes, vwapSeries, lookback) {
   if (closes.length < lookback || vwapSeries.length < lookback) return null;
@@ -70,12 +71,11 @@ function sepLine(ch = "─") {
 
 function renderScreen(text) {
   try {
-    readline.cursorTo(process.stdout, 0, 0);
-    readline.clearScreenDown(process.stdout);
+    process.stdout.write("\x1b[H"); // Faster than cursorTo(0,0)
+    process.stdout.write(text + "\x1b[J"); // Faster than clearScreenDown()
   } catch {
     // ignore
   }
-  process.stdout.write(text);
 }
 
 function stripAnsi(s) {
@@ -403,6 +403,9 @@ async function main() {
   let prevSpotPrice = null;
   let prevCurrentPrice = null;
   let priceToBeatState = { slug: null, value: null, setAtMs: null };
+  let currentPosition = { active: false, side: null, entryPrice: null, tokenId: null, marketSlug: null, entryTime: null };
+  let loopCount = 0;
+  let lastError = null;
 
   const header = [
     "timestamp",
@@ -416,7 +419,8 @@ async function main() {
     "mkt_down",
     "edge_up",
     "edge_down",
-    "recommendation"
+    "recommendation",
+    "market_slug"
   ];
 
   while (true) {
@@ -431,6 +435,9 @@ async function main() {
     const chainlinkWsTick = chainlinkStream.getLast();
     const chainlinkWsPrice = chainlinkWsTick?.price ?? null;
 
+    loopCount += 1;
+    const heartbeat = ["/", "-", "\\", "|"][loopCount % 4];
+
     try {
       const chainlinkPromise = polymarketWsPrice !== null
         ? Promise.resolve({ price: polymarketWsPrice, updatedAt: polymarketWsTick?.updatedAt ?? null, source: "polymarket_ws" })
@@ -438,13 +445,17 @@ async function main() {
           ? Promise.resolve({ price: chainlinkWsPrice, updatedAt: chainlinkWsTick?.updatedAt ?? null, source: "chainlink_ws" })
           : fetchChainlinkBtcUsd();
 
-      const [klines1m, klines5m, lastPrice, chainlink, poly] = await Promise.all([
-        fetchKlines({ interval: "1m", limit: 240 }),
-        fetchKlines({ interval: "5m", limit: 200 }),
-        fetchLastPrice(),
-        chainlinkPromise,
-        fetchPolymarketSnapshot()
-      ]);
+      const [klines1m, klines5m, lastPrice, chainlink, poly] = await promiseWithTimeout(
+        Promise.all([
+          fetchKlines({ interval: "1m", limit: 240 }),
+          fetchKlines({ interval: "5m", limit: 200 }),
+          fetchLastPrice(),
+          chainlinkPromise,
+          fetchPolymarketSnapshot()
+        ]),
+        15000,
+        "Main data fetch timeout (15s)"
+      );
 
       const settlementMs = poly.ok && poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
       const settlementLeftMin = settlementMs ? (settlementMs - Date.now()) / 60_000 : null;
@@ -514,6 +525,60 @@ async function main() {
 
       const rec = decide({ remainingMinutes: timeLeftMin, edgeUp: edge.edgeUp, edgeDown: edge.edgeDown, modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown });
 
+      // --- TRADE EXECUTION LOGIC ---
+      let marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
+
+      if (!currentPosition.active && rec.action === "ENTER" && poly.ok) {
+        const side = rec.side; // "UP" or "DOWN"
+        const tokenId = side === "UP" ? poly.tokens.upTokenId : poly.tokens.downTokenId;
+        const price = side === "UP" ? poly.prices.up : poly.prices.down;
+
+        const trade = await trader.executeTrade({
+          side,
+          tokenId,
+          price,
+          marketSlug,
+          reason: `Signal: ${rec.strength} | Edge: ${edge.edgeUp?.toFixed(4)}`
+        });
+
+        if (trade && trade.status !== "FAILED") {
+          currentPosition = {
+            active: true,
+            side: side,
+            entryPrice: price,
+            tokenId,
+            marketSlug,
+            entryTime: new Date()
+          };
+        }
+      } else if (currentPosition.active) {
+        // Automatic EXIT logic if market expires or signal flips
+        const shouldExit = (marketSlug !== currentPosition.marketSlug) ||
+          (timeLeftMin < 0.5) ||
+          (currentPosition.side === "UP" && rec.side === "DOWN" && rec.strength === "STRONG") ||
+          (currentPosition.side === "DOWN" && rec.side === "UP" && rec.strength === "STRONG");
+
+        if (shouldExit) {
+          console.log(`\n🛑 [EXIT SIGNAL] Closing ${currentPosition.side} position.`);
+          const exitPrice = currentPosition.side === "UP" ? (poly.prices?.up || 0) : (poly.prices?.down || 0);
+
+          await trader.logTrade({
+            timestamp: new Date().toISOString(),
+            marketSlug: currentPosition.marketSlug,
+            side: "EXIT_" + currentPosition.side,
+            tokenId: currentPosition.tokenId,
+            price: exitPrice,
+            quantity: 0,
+            totalCost: 0,
+            status: "CLOSED",
+            reason: marketSlug !== currentPosition.marketSlug ? "Market Expired" : "Signal Reversal"
+          });
+
+          currentPosition = { active: false, side: null, entryPrice: null, tokenId: null, marketSlug: null, entryTime: null };
+        }
+      }
+      // -----------------------------
+
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
 
       const macdLabel = macd === null
@@ -579,7 +644,7 @@ async function main() {
 
       const spotPrice = wsPrice ?? lastPrice;
       const currentPrice = chainlink?.price ?? null;
-      const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
+      marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
       const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
 
       if (marketSlug && priceToBeatState.slug !== marketSlug) {
@@ -683,6 +748,12 @@ async function main() {
         "",
         sepLine(),
         "",
+        section("TRADING STATUS"),
+        kv("Position:", currentPosition.active ? `${ANSI.white}${currentPosition.side}${ANSI.reset} @ ${currentPosition.entryPrice}¢` : `${ANSI.gray}NONE${ANSI.reset}`),
+        kv("Last Signal:", rec.action === "ENTER" ? `${rec.side === "UP" ? ANSI.green : ANSI.red}${rec.side} (${rec.strength})${ANSI.reset}` : `${ANSI.gray}WAITING${ANSI.reset}`),
+        "",
+        sepLine(),
+        "",
         kv("POLYMARKET:", polyHeaderValue),
         liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
         settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
@@ -696,6 +767,8 @@ async function main() {
         sepLine(),
         "",
         kv("ET | Session:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
+        kv("Status:", `${ANSI.green}RUNNING ${heartbeat}${ANSI.reset} | Mem: ${(process.memoryUsage().rss / 1024 / 1024).toFixed(1)}MB | Loop: ${loopCount}`),
+        lastError ? kv("Last Error:", `${ANSI.lightRed}${lastError}${ANSI.reset}`) : null,
         "",
         sepLine(),
         centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
@@ -718,11 +791,18 @@ async function main() {
         marketDown,
         edge.edgeUp,
         edge.edgeDown,
-        rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE"
+        rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE",
+        marketSlug
       ]);
     } catch (err) {
+      lastError = err?.message ?? String(err);
       console.log("────────────────────────────");
-      console.log(`Error: ${err?.message ?? String(err)}`);
+      console.log(`⚠️  Error in main loop: ${lastError}`);
+
+      if (lastError.includes("timeout")) {
+        console.log(`⏭️  Timeout detected - skipping this iteration and continuing...`);
+      }
+
       console.log("────────────────────────────");
     }
 
