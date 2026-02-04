@@ -24,7 +24,8 @@ function toFiniteNumber(x) {
 
 export function startPolymarketChainlinkPriceStream({
   wsUrl = CONFIG.polymarket.liveDataWsUrl,
-  symbolIncludes = "btc",
+  // Use POLYMARKET_WS_SYMBOL_INCLUDES=btc|eth (defaults to btc)
+  symbolIncludes = (process.env.POLYMARKET_WS_SYMBOL_INCLUDES || "btc"),
   onUpdate
 } = {}) {
   if (!wsUrl) {

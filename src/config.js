@@ -1,5 +1,6 @@
 export const CONFIG = {
-  symbol: "BTCUSDT",
+  // Set SYMBOL=BTCUSDT or SYMBOL=ETHUSDT when running multiple processes
+  symbol: process.env.SYMBOL || "BTCUSDT",
   binanceBaseUrl: "https://api.binance.com",
   gammaBaseUrl: "https://gamma-api.polymarket.com",
   clobBaseUrl: "https://clob.polymarket.com",
